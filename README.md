@@ -98,7 +98,7 @@ PYTHONPATH=src python -m nyh_line fd-globe submit
    .venv/bin/python -c "from nyh_line.policy import PROGRAMS; from nyh_line.settings import environ_map, startup_problems; env = environ_map(); [print(p, startup_problems(l, r, env) or 'OK') for p, l, r in PROGRAMS]"
    ```
 
-   切换完成后，把新 ini 改成 `autostart=true`、旧线路 ini 改成 `autostart=false`，否则 supervisord 重启时会拉起旧线路。环境文件填好之前执行 `supervisorctl start <程序名>`，程序会在拉单前退出并进入 FATAL，`logs/<程序名>.log` 里写着缺的键名。这可以用来确认目录、解释器和日志路径都对。
+   切换完成后，把新 ini 改成 `autostart=true`，并把旧线路 ini 移出 include 目录（生产放在 `/home/supervisor/profile-retired/`），再对旧程序名执行 `supervisorctl update` 注销。只改 `autostart=false` 不够：`supervisorctl start all` 不看 `autostart`，会把还登记着的旧线路一起拉起来，新旧进程用同一批设备号并跑。环境文件填好之前执行 `supervisorctl start <程序名>`，程序会在拉单前退出并进入 FATAL，`logs/<程序名>.log` 里写着缺的键名。这可以用来确认目录、解释器和日志路径都对。
 
 6. 日志。每行带时间、级别、线程名。按 `task_id` 可以查到一单的拉单、上游结果和每次 Feedback。日志里记完整手机号，不记设备密钥、上游密钥、VTSI 密码、签名、`auth` 和 `price`。
 
