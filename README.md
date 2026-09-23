@@ -82,15 +82,23 @@ PYTHONPATH=src python -m nyh_line fd-globe submit
 
 4. 告警收件人。`<前缀>_ALERT_USER_IDS` 填逗号分隔的用户 ID。留空时这条线路不发模板，回写照常。
 
-5. 装 Supervisor 定义并核对。
+5. 装 Supervisor 定义并核对。先看 `/etc/supervisor/supervisord.conf` 的 `[include]` 指向哪个目录（生产是 `/home/supervisor/profile/`），把 ini 放进去并替换部署路径。
 
    ```bash
-   cp deploy/supervisor/*.ini /etc/supervisor/conf.d/
-   supervisorctl reread
-   supervisorctl update
+   for f in deploy/supervisor/*.ini; do
+     sed "s#/opt/nyh-line-core#<部署目录>#g" "$f" > /home/supervisor/profile/$(basename "$f")
+   done
+   supervisorctl reread                      # 应只列出 10 个 line-* 程序
+   supervisorctl update line-fd-globe-submit ...   # 只对这 10 个程序执行，避免重启别的程序
    ```
 
-   ini 都是 `autostart=false`，`update` 只登记不启动。环境文件填好之前执行 `supervisorctl start <程序名>`，程序会在拉单前退出并进入 FATAL，`logs/<程序名>.log` 里写着缺的键名。这可以用来确认目录、解释器和日志路径都对。
+   ini 都是 `autostart=false`，`update` 只登记不启动。在不起进程的前提下核对配置：
+
+   ```bash
+   .venv/bin/python -c "from nyh_line.policy import PROGRAMS; from nyh_line.settings import environ_map, startup_problems; env = environ_map(); [print(p, startup_problems(l, r, env) or 'OK') for p, l, r in PROGRAMS]"
+   ```
+
+   切换完成后，把新 ini 改成 `autostart=true`、旧线路 ini 改成 `autostart=false`，否则 supervisord 重启时会拉起旧线路。环境文件填好之前执行 `supervisorctl start <程序名>`，程序会在拉单前退出并进入 FATAL，`logs/<程序名>.log` 里写着缺的键名。这可以用来确认目录、解释器和日志路径都对。
 
 6. 日志。每行带时间、级别、线程名。按 `task_id` 可以查到一单的拉单、上游结果和每次 Feedback。日志里记完整手机号，不记设备密钥、上游密钥、VTSI 密码、签名、`auth` 和 `price`。
 
