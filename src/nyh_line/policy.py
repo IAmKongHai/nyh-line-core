@@ -16,6 +16,8 @@ class LinePolicy:
     timeout: float | None = None
     busy_sleep: float = 0.2
     balance_interval: float = 60
+    # 一笔意外出错后的退避秒数，与旧菲岛主循环的 sleep(3) 一致。
+    error_backoff: float = 3
     # 菲岛：连续这么多笔结果未知就暂停拉单。0 表示不暂停。
     unknown_pause_after: int = 0
     unknown_pause_seconds: float = 0

@@ -16,10 +16,10 @@ from nyh_line.log_setup import configure_logging
 from nyh_line.lines import dito_vtsi, globe_fd, globe_vtsi, smart_fd, smart_vtsi, yingla
 from nyh_line.policy import known_role, policy_for
 from nyh_line.runner import (
+    CountrySlot,
     PollLoop,
     UnknownStreak,
     XiaolaSubmitLoop,
-    apply_batch_config,
     install_signals,
     maintain,
     wait_or_stop,
@@ -27,7 +27,6 @@ from nyh_line.runner import (
 from nyh_line.settings import (
     alert_user_ids,
     center_base_url,
-    country_for_thread,
     device_id_key,
     device_key_key,
     environ_map,
@@ -114,7 +113,7 @@ def build_fd_loop(line: str, center, client, stop: threading.Event, *, wait=None
         streak.observe(outcome)
         return outcome
 
-    return PollLoop(policy, center.get_task, handle, sleep=sleep, randint=randint, stop=stop)
+    return PollLoop(policy, center.get_task, handle, sleep=sleep, randint=randint, stop=stop, wait=pause)
 
 
 def _serve_fd(line: str, env, stop: threading.Event) -> None:
@@ -128,8 +127,41 @@ def _serve_fd(line: str, env, stop: threading.Event) -> None:
     )
     loop = build_fd_loop(line, center, client, stop)
     install_signals(loop)
-    while not stop.is_set():
-        loop.run_round()
+    loop.run_forever()
+
+
+def build_check_loop(
+    line: str, center, check_one, balance_query, stop: threading.Event, *, wait=None, sleep=None, randint=None, clock=None
+) -> PollLoop:
+    """查单循环：每轮先同步余额，再取执行中的发送行逐条查询。一条坏记录不挡住后面的记录。"""
+    policy = policy_for(line, "check")
+    balance = CheckBalance(line, balance_query, center.synchronize_balance)
+    now = clock or time.time
+
+    def pull():
+        payload = center.in_executing_tasks()
+        records = _records(payload)
+        if not records:
+            if isinstance(payload, dict) and str(payload.get("code")) != "0":
+                return payload
+            return {"code": 120, "msg": "empty"}
+        return {"code": 0, "data": records}
+
+    def handle(records):
+        for record in records:
+            loop.guard(check_one, record)
+
+    loop = PollLoop(
+        policy,
+        pull,
+        handle,
+        sleep=sleep,
+        randint=randint,
+        stop=stop,
+        wait=wait,
+        before_round=lambda: balance.sync_balance(now()),
+    )
+    return loop
 
 
 def build_vtsi_gateway(line: str, role: str, env, ca_path: str) -> VtsiGateway:
@@ -155,16 +187,8 @@ def _serve_vtsi(line: str, role: str, env, stop: threading.Event) -> None:
         submit = _VTSI_SUBMIT[line]
 
         def worker():
-            def run():
-                loop = PollLoop(policy, center.get_task, lambda task: submit(task, center, gateway), stop=stop)
-                while not stop.is_set():
-                    try:
-                        loop.run_round()
-                    except Exception:
-                        logger.exception("VTSI 提交线程退出，准备按配置数量再拉起")
-                        return
-
-            return run
+            loop = PollLoop(policy, center.get_task, lambda task: submit(task, center, gateway), stop=stop)
+            return loop.run_forever
 
         keeper = maintain(line, role, worker, stop)
         install_signals(PollLoop(policy, lambda: {"code": 120}, lambda task: None, stop=stop))
@@ -174,108 +198,85 @@ def _serve_vtsi(line: str, role: str, env, stop: threading.Event) -> None:
         return
 
     check = _VTSI_CHECK[line]
-    balance = CheckBalance(line, lambda: parse_wallet_balance(gateway.balance()), center.synchronize_balance)
-
-    def pull():
-        payload = center.in_executing_tasks()
-        records = _records(payload)
-        if not records:
-            if isinstance(payload, dict) and str(payload.get("code")) != "0":
-                return payload
-            return {"code": 120, "msg": "empty"}
-        return {"code": 0, "data": records}
-
-    def handle(records):
-        for record in records:
-            check(record, center, gateway)
-
-    loop = PollLoop(policy, pull, handle, stop=stop)
+    loop = build_check_loop(
+        line,
+        center,
+        lambda record: check(record, center, gateway),
+        lambda: parse_wallet_balance(gateway.balance()),
+        stop,
+    )
     install_signals(loop)
-    while not stop.is_set():
-        balance.sync_balance(time.time())
-        loop.run_round()
+    loop.run_forever()
+
+
+def _xiaola_client(env) -> XiaolaClient:
+    return XiaolaClient(
+        base_url=env["XIAOLA_API_BASE_URL"],
+        username=env["XIAOLA_API_USERNAME"],
+        secret_key=env["XIAOLA_API_SECRET_KEY"],
+        transport=requests_transport(),
+    )
+
+
+def xiaola_slot_work(env, blocklist, stop: threading.Event, *, make_center=None, make_client=None, wait=None, randint=None):
+    """一个赢啦国家槽位的工作函数。每次（重新）开工都新建客户端，批次控制器用槽位上的那一个。"""
+    policy = policy_for("xiaola", "submit")
+    make_center = make_center or (lambda country: _make_center(env, "xiaola", xiaola_profile(), country))
+    make_client = make_client or (lambda: _xiaola_client(env))
+    randint = randint or random.randint
+
+    def work(slot: CountrySlot) -> str:
+        center = make_center(slot.country)
+        client = make_client()
+        cycle = XiaolaSubmitLoop(
+            country=slot.country,
+            batch=slot.batch,
+            pull=center.get_task,
+            handle=lambda task: yingla.submit_task(task, center, client, blocklist),
+            stop=stop,
+            wait=wait,
+        )
+        while not stop.is_set():
+            outcome = cycle.advance()
+            if outcome in {"interrupted", "stopped", "no-country"}:
+                return outcome
+            if outcome == "idle" and not cycle.wait(randint(policy.idle_low, policy.idle_high)):
+                return "interrupted"
+        return "stopped"
+
+    return work
 
 
 def _serve_xiaola(role: str, env, stop: threading.Event) -> None:
     policy = policy_for("xiaola", role)
     if role == "check":
         center = _make_center(env, "xiaola", xiaola_profile())
-        client = XiaolaClient(
-            base_url=env["XIAOLA_API_BASE_URL"],
-            username=env["XIAOLA_API_USERNAME"],
-            secret_key=env["XIAOLA_API_SECRET_KEY"],
-            transport=requests_transport(),
-        )
-        balance = CheckBalance(
+        client = _xiaola_client(env)
+        loop = build_check_loop(
             "xiaola",
+            center,
+            lambda record: yingla.check_task(record, center, client),
             lambda: parse_xiaola_balance(client.read_balance()),
-            center.synchronize_balance,
+            stop,
         )
-
-        def pull():
-            payload = center.in_executing_tasks()
-            records = _records(payload)
-            if not records:
-                if isinstance(payload, dict) and str(payload.get("code")) != "0":
-                    return payload
-                return {"code": 120, "msg": "empty"}
-            return {"code": 0, "data": records}
-
-        def handle(records):
-            for record in records:
-                yingla.check_task(record, center, client)
-
-        loop = PollLoop(policy, pull, handle, stop=stop)
         install_signals(loop)
-        while not stop.is_set():
-            balance.sync_balance(time.time())
-            loop.run_round()
+        loop.run_forever()
         return
 
     blocklist = Blocklist(str(env.get("BLOCKLIST_FILE_PATH") or ""))
     numbers = xiaola_submit_settings(env)
-
-    def start_one(country: str):
-        def run():
-            batch = BatchController(numbers.interval_time, numbers.max_tasks_per_batch, numbers.batch_interval)
-            center = _make_center(env, "xiaola", xiaola_profile(), country)
-            client = XiaolaClient(
-                base_url=env["XIAOLA_API_BASE_URL"],
-                username=env["XIAOLA_API_USERNAME"],
-                secret_key=env["XIAOLA_API_SECRET_KEY"],
-                transport=requests_transport(),
-            )
-            cycle = XiaolaSubmitLoop(
-                country=country,
-                batch=batch,
-                pull=center.get_task,
-                handle=lambda task: yingla.submit_task(task, center, client, blocklist),
-                stop=stop,
-            )
-            while not stop.is_set():
-                apply_batch_config(
-                    batch,
-                    float(env.get("RECHARGE_INTERVAL_TIME") or batch.interval_time),
-                    int(env.get("RECHARGE_MAX_TASKS_PER_BATCH") or batch.max_tasks_per_batch),
-                    float(env.get("RECHARGE_BATCH_INTERVAL") or batch.batch_interval),
-                )
-                outcome = cycle.advance()
-                if outcome in {"interrupted", "stopped", "no-country"}:
-                    return
-                if outcome == "idle":
-                    delay = random.randint(policy.idle_low, policy.idle_high)
-                    if not cycle.wait(delay):
-                        return
-
-        return run
-
-    threads = []
-    for _thread_id, country in threads_to_start(env):
-        if not country_for_thread(_thread_id, env):
-            continue
-        thread = threading.Thread(target=start_one(country), daemon=True)
-        thread.start()
-        threads.append(thread)
+    work = xiaola_slot_work(env, blocklist, stop)
+    slots = [
+        CountrySlot(
+            thread_id,
+            country,
+            BatchController(numbers.interval_time, numbers.max_tasks_per_batch, numbers.batch_interval),
+            work,
+            stop,
+        )
+        for thread_id, country in threads_to_start(env)
+    ]
+    threads = [slot.start() for slot in slots]
     install_signals(PollLoop(policy, lambda: {"code": 120}, lambda task: None, stop=stop))
     while not stop.is_set():
         stop.wait(1)

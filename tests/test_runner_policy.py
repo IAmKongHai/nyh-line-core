@@ -1,27 +1,38 @@
 """空闲间隔、停止信号、线程再拉起、余额节流。"""
 
+import logging
 import signal
 import threading
 import time
+import xml.etree.ElementTree as ET
 
 import pytest
 
-from nyh_line.lines import dito_vtsi
+from nyh_line.lines import dito_vtsi, registry
 from nyh_line.lines.registry import CheckBalance
 from nyh_line.policy import policy_for
-from nyh_line.runner import PollLoop, install_signals, maintain
+from nyh_line.runner import CountrySlot, PollLoop, install_signals, maintain, respawn_delay, run_one
+from nyh_line.upstream.fd import FdClient
 from nyh_line.upstream.vtsi import VtsiGateway, parse_wallet_balance
 from nyh_line.upstream.xiaola import parse_xiaola_balance
-from tests.support import FakeTransport, actions, make_center
-from tests.test_vtsi_status import Session
+from nyh_line.xiaola.batch import BatchController
+from tests.support import FakeResponse, FakeTransport, actions, make_center
+from tests.test_vtsi_status import Session, soap
 
 
 class ListLog:
     def __init__(self):
         self.errors = []
+        self.infos = []
 
     def error(self, message, *args):
         self.errors.append(message % args if args else message)
+
+    def exception(self, message, *args):
+        self.errors.append(message % args if args else message)
+
+    def info(self, message, *args):
+        self.infos.append(message % args if args else message)
 
 
 @pytest.mark.parametrize(
@@ -203,3 +214,250 @@ def test_parsed_balance_is_forwarded_as_is():
     worker = CheckBalance("vtsi-dito", query, synced.append)
     assert worker.sync_balance(0) == "synced"
     assert synced == ["12"]
+
+
+# ---- 每笔防护与线程看护（U5） ----
+
+
+def test_fd_handle_error_is_contained_and_backs_off(monkeypatch, caplog):
+    caplog.set_level(logging.ERROR)
+    pulls = {"n": 0}
+
+    def center_response(_url, data):
+        if data.get("action") == "GetTasks":
+            pulls["n"] += 1
+            return FakeResponse({"code": 0, "data": {"task_id": 70 + pulls["n"], "phone_number": "9"}})
+        return FakeResponse({"code": 0})
+
+    def boom(task, center, client, on_unknown=None):
+        raise ValueError("bad task")
+
+    monkeypatch.setitem(registry._FD_SUBMIT, "fd-globe", boom)
+    waits = []
+    loop = registry.build_fd_loop(
+        "fd-globe",
+        make_center(FakeTransport(response=center_response)),
+        FdClient(base_url="http://fd.invalid", uid="u", key="k", transport=FakeTransport()),
+        threading.Event(),
+        wait=lambda seconds: waits.append(seconds) or True,
+        sleep=lambda _seconds: None,
+        randint=lambda start, _end: start,
+    )
+    assert loop.run_round() == "worked"
+    assert waits == [policy_for("fd-globe", "submit").error_backoff] == [3]
+    errors = [record.getMessage() for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1 and "task_id=71" in errors[0]
+    assert loop.run_round() == "worked"
+    assert pulls["n"] == 2
+
+
+def _check_loop(records, query_results, balance_query=None, center_extra=None, sync=None):
+    """查单一轮：inExecutingTasks 给出 records，gateway.query 按顺序返回 query_results。"""
+    def center_response(_url, data):
+        if data.get("action") == "inExecutingTasks":
+            return FakeResponse({"code": 0, "data": records})
+        if center_extra is not None:
+            return center_extra(data)
+        return FakeResponse({"code": 0})
+
+    transport = FakeTransport(response=center_response)
+    center = make_center(transport)
+    if sync is not None:
+        center.synchronize_balance = sync
+    results = list(query_results)
+    queried = []
+
+    class Gateway:
+        def query(self, merchant_id):
+            queried.append(merchant_id)
+            result = results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        def balance(self):
+            raise AssertionError("不应查余额")
+
+    gateway = Gateway()
+    waits = []
+    loop = registry.build_check_loop(
+        "vtsi-dito",
+        center,
+        lambda record: dito_vtsi.check_task(record, center, gateway),
+        balance_query or (lambda: "12"),
+        threading.Event(),
+        wait=lambda seconds: waits.append(seconds) or True,
+        sleep=lambda _seconds: None,
+        randint=lambda start, _end: start,
+        clock=lambda: 0,
+    )
+    return loop, transport, queried, waits
+
+
+def test_bad_first_record_does_not_block_the_rest(caplog):
+    """AE5：第一条缺 id，第二、三条照常查询并按表回写，ERROR 一条。"""
+    caplog.set_level(logging.ERROR)
+    records = [{"user_number": "1"}, {"id": 2, "user_number": "2"}, {"id": 3, "user_number": "3"}]
+    loop, transport, queried, _waits = _check_loop(records, [soap("2", "2"), soap("2", "3")])
+    loop.run_cycle()
+    assert queried == ["v2", "v3"]
+    assert [(body["task_id"], body["status"]) for body in actions(transport, "Feedback")] == [(2, 2), (3, 3)]
+    assert len([record for record in caplog.records if record.levelno == logging.ERROR]) == 1
+
+
+def test_unparseable_query_result_skips_only_that_record():
+    records = [{"id": 1, "user_number": "1"}, {"id": 2, "user_number": "2"}]
+    loop, transport, queried, _waits = _check_loop(records, [ET.ParseError("bad xml"), soap("2", "2")])
+    loop.run_cycle()
+    assert queried == ["v1", "v2"]
+    assert [(body["task_id"], body["status"]) for body in actions(transport, "Feedback")] == [(2, 2)]
+
+
+def test_balance_sync_error_does_not_stop_the_round(caplog):
+    caplog.set_level(logging.ERROR)
+    records = [{"id": 5, "user_number": "5"}]
+
+    synced = []
+
+    def sync(amount):
+        synced.append(amount)
+        raise RuntimeError("center down")
+
+    loop, transport, queried, _waits = _check_loop(records, [soap("2", "2")], sync=sync)
+    loop.run_cycle()
+    assert queried == ["v5"]
+    assert [body["status"] for body in actions(transport, "Feedback")] == [2]
+    assert synced == ["12"]
+    assert len([record for record in caplog.records if record.levelno == logging.ERROR]) == 1
+
+
+def test_run_one_does_not_swallow_keyboard_interrupt():
+    def interrupt(_item):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_one(interrupt, {"task_id": 1}, task_id=1, pause=lambda _seconds: True)
+
+
+def _slot(work, stop=None, waits=None):
+    stop = stop or threading.Event()
+    waits = waits if waits is not None else []
+    batch = BatchController(3, 10, 15)
+    slot = CountrySlot(1, "PH", batch, work, stop, wait=lambda seconds: waits.append(seconds) or True)
+    return slot, batch, waits
+
+
+def test_crashed_slot_restarts_same_country_with_same_batch():
+    seen = []
+
+    def work(slot):
+        seen.append((slot.country, slot.batch, slot.batch.tasks_in_current_batch))
+        if len(seen) == 1:
+            slot.batch.on_task_finished()
+            raise RuntimeError("thread crashed")
+        return "stopped"
+
+    slot, batch, waits = _slot(work)
+    assert slot.run() == "stopped"
+    assert waits == [2]
+    assert [item[0] for item in seen] == ["PH", "PH"]
+    assert seen[1][1] is batch
+    assert seen[1][2] == 1
+
+
+@pytest.mark.parametrize("outcome", ["no-country", "stopped", "interrupted"])
+def test_slot_normal_return_is_not_restarted(outcome):
+    calls = []
+
+    def work(_slot):
+        calls.append(1)
+        return outcome
+
+    slot, _batch, waits = _slot(work)
+    assert slot.run() == outcome
+    assert calls == [1] and waits == []
+
+
+def test_slot_backoff_grows_and_caps():
+    def work(slot):
+        if slot.crashes < 3:
+            raise RuntimeError("again")
+        return "stopped"
+
+    slot, _batch, waits = _slot(work)
+    slot.run()
+    assert waits == [2, 4, 6]
+    assert respawn_delay(15) == 30 and respawn_delay(40) == 30
+
+
+def test_stop_during_slot_backoff_ends_without_restart():
+    stop = threading.Event()
+    calls = []
+
+    def work(_slot):
+        calls.append(1)
+        raise RuntimeError("crash")
+
+    slot = CountrySlot(1, "PH", BatchController(3, 10, 15), work, stop, wait=lambda _seconds: stop.set() or False)
+    assert slot.run() == "stopped"
+    assert calls == [1]
+
+
+def test_slot_thread_is_named_by_country():
+    done = threading.Event()
+    slot, _batch, _waits = _slot(lambda _slot: done.set() or "stopped")
+    thread = slot.start()
+    thread.join(timeout=2)
+    assert thread.name == "xiaola-PH" and done.is_set()
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_vtsi_keeper_backs_off_then_restores_four_threads():
+    stop = threading.Event()
+    waits = []
+    born = []
+    lock = threading.Lock()
+
+    def factory():
+        def run():
+            with lock:
+                born.append(1)
+                index = len(born)
+            if index == 2:
+                raise RuntimeError("worker crashed")
+            stop.wait(5)
+
+        return run
+
+    keeper = maintain("vtsi-globe", "submit", factory, stop, wait=lambda seconds: waits.append(seconds) or True)
+    assert keeper.reconcile() == 4
+    for _ in range(200):
+        if any(not thread.is_alive() for thread in keeper.workers):
+            break
+        time.sleep(0.01)
+    assert keeper.reconcile() == 4
+    for _ in range(200):
+        if len(born) == 5:
+            break
+        time.sleep(0.01)
+    assert waits == [2]
+    assert len(born) == 5
+    assert sum(1 for thread in keeper.workers if thread.is_alive()) == 4
+    stop.set()
+    for thread in keeper.workers:
+        thread.join(timeout=1)
+
+
+def test_stop_during_keeper_backoff_does_not_start_worker():
+    stop = threading.Event()
+    born = []
+
+    def factory():
+        return lambda: born.append(1)
+
+    keeper = maintain("vtsi-dito", "submit", factory, stop, wait=lambda _seconds: stop.set() or False)
+    keeper.reconcile()
+    keeper.workers[0].join(timeout=1)
+    keeper.reconcile()
+    keeper.workers[0].join(timeout=1)
+    assert born == [1]
