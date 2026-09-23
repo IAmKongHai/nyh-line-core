@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+config.json
+blocked_numbers.txt
+logs/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
