@@ -27,9 +27,14 @@ from nyh_line.settings import (
     alert_user_ids,
     center_base_url,
     country_for_thread,
+    device_id_key,
+    device_key_key,
     environ_map,
-    missing_keys,
+    sim_id_key,
+    startup_problems,
     threads_to_start,
+    vtsi_account_key,
+    xiaola_submit_settings,
 )
 from nyh_line.upstream.fd import FdClient
 from nyh_line.upstream.vtsi import VtsiGateway, parse_wallet_balance, zeep_session_factory
@@ -75,9 +80,9 @@ class CheckBalance:
 def _make_center(env, line: str, profile, country_code: str = ""):
     return CenterClient(
         base_url=center_base_url(env),
-        device_id=env["CENTER_DEVICE_ID"],
-        device_key=env["CENTER_DEVICE_KEY"],
-        sim_id=env["CENTER_SIM_ID"],
+        device_id=str(env[device_id_key(line)]).strip(),
+        device_key=str(env[device_key_key(line)]).strip(),
+        sim_id=str(env[sim_id_key(line)]).strip(),
         profile=profile,
         transport=requests_transport(),
         version=str(env.get("CENTER_VERSION", "")).strip() or "2019_11_11__12_04_05",
@@ -133,7 +138,7 @@ def _serve_vtsi(line: str, role: str, env, stop: threading.Event) -> None:
         lambda: zeep_session_factory(env["VTSI_WSDL"], policy.timeout or 50),
         username=env["VTSI_USERNAME"],
         password=env["VTSI_PASSWORD"],
-        account=env["VTSI_ACCOUNT"],
+        account=env[vtsi_account_key(line)],
         timeout=policy.timeout or 50,
     )
     if role == "submit":
@@ -218,14 +223,11 @@ def _serve_xiaola(role: str, env, stop: threading.Event) -> None:
         return
 
     blocklist = Blocklist(str(env.get("BLOCKLIST_FILE_PATH") or ""))
+    numbers = xiaola_submit_settings(env)
 
     def start_one(country: str):
         def run():
-            batch = BatchController(
-                float(env.get("RECHARGE_INTERVAL_TIME") or 3),
-                int(env.get("RECHARGE_MAX_TASKS_PER_BATCH") or 10),
-                float(env.get("RECHARGE_BATCH_INTERVAL") or 15),
-            )
+            batch = BatchController(numbers.interval_time, numbers.max_tasks_per_batch, numbers.batch_interval)
             center = _make_center(env, "xiaola", xiaola_profile(), country)
             client = XiaolaClient(
                 base_url=env["XIAOLA_API_BASE_URL"],
@@ -283,11 +285,12 @@ def serve_forever(line: str, role: str, env) -> None:
 
 
 def run_line(line: str, role: str, env=None, serve=None) -> int:
-    """环境不齐就在拉单前退出。"""
+    """配置有任何问题就在拉单前退出。stderr 只列键名，不打印键值。"""
     current = environ_map(env)
-    missing = missing_keys(line, current)
-    if missing:
-        print("缺少环境变量: " + ",".join(missing), file=sys.stderr)
+    problems = startup_problems(line, role, current)
+    if problems:
+        for problem in problems:
+            print(problem, file=sys.stderr)
         return 2
     runner = serve or serve_forever
     runner(line, role, current)
