@@ -6,7 +6,8 @@ import logging
 import pytest
 
 from nyh_line.lines import yingla
-from nyh_line.runner import XiaolaSubmitLoop, apply_batch_config
+from nyh_line.lines.registry import xiaola_slot_work
+from nyh_line.runner import CountrySlot, XiaolaSubmitLoop, apply_batch_config
 from nyh_line.settings import country_for_thread, threads_to_start
 from nyh_line.upstream.xiaola import XiaolaClient
 from nyh_line.xiaola.batch import BatchController
@@ -293,3 +294,133 @@ def test_batch_reload_keeps_current_count():
     assert batch.tasks_in_current_batch == 1
     assert batch.max_tasks_per_batch == 3
     assert batch.batch_interval == 9
+
+
+# ---- 单笔间隔（U6） ----
+
+
+def _interval_loop(handle, batch=None, stop=None):
+    pulls = {"n": 0}
+    events = []
+
+    def pull():
+        pulls["n"] += 1
+        events.append(("pull", pulls["n"]))
+        return {"code": 0, "data": {"task_id": pulls["n"], "phone_number": "9123456789", "content": "P"}}
+
+    def wait(seconds):
+        events.append(("wait", seconds))
+        return True
+
+    loop = XiaolaSubmitLoop(
+        country="PH",
+        batch=batch or BatchController(3, 10, 15),
+        pull=pull,
+        handle=handle,
+        stop=stop or threading.Event(),
+        wait=wait,
+    )
+    return loop, events
+
+
+def test_accepted_task_waits_interval_before_next_pull():
+    _upstream, _center_transport, client, center = _clients({"code": 10000})
+    loop, events = _interval_loop(lambda task: yingla.submit_task(task, center, client, None))
+    assert loop.advance() == "pulled"
+    assert loop.advance() == "interval-done"
+    assert loop.advance() == "pulled"
+    assert events == [("pull", 1), ("wait", 3), ("pull", 2)]
+
+
+def test_tenth_task_waits_batch_interval_then_resets_count():
+    batch = BatchController(3, 10, 15)
+    loop, events = _interval_loop(lambda task: "accepted", batch=batch)
+    for _ in range(10):
+        assert loop.advance() == "pulled"
+        loop.advance()
+    waits = [seconds for kind, seconds in events if kind == "wait"]
+    assert waits == [3] * 9 + [15]
+    assert batch.tasks_in_current_batch == 0
+
+
+def _raise(_task):
+    raise ValueError("bad task")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["blocked", "missing-product", "unknown", "raises"],
+)
+def test_every_pulled_task_counts_and_waits(kind, tmp_path):
+    blocked_file = tmp_path / "numbers.txt"
+    blocked_file.write_text("9123456789\n")
+    upstream, _center_transport, client, center = _clients({"error_code": -2, "error_msg": "local"})
+    handles = {
+        "blocked": lambda task: yingla.submit_task(task, center, client, Blocklist(str(blocked_file))),
+        "missing-product": lambda task: yingla.submit_task({**task, "content": ""}, center, client, None),
+        "unknown": lambda task: yingla.submit_task(task, center, client, None),
+        "raises": _raise,
+    }
+    batch = BatchController(3, 10, 15)
+    loop, events = _interval_loop(handles[kind], batch=batch)
+    assert loop.advance() == "pulled"
+    assert batch.tasks_in_current_batch == 1
+    assert loop.advance() == "interval-done"
+    assert events == [("pull", 1), ("wait", 3)]
+
+
+def test_idle_pull_is_not_counted_and_waits_idle_range():
+    stop = threading.Event()
+    waits = []
+    bounds = []
+
+    class IdleCenter:
+        def get_task(self):
+            return {"code": 120, "msg": "empty"}
+
+    def wait(seconds):
+        waits.append(seconds)
+        stop.set()
+        return False
+
+    def randint(low, high):
+        bounds.append((low, high))
+        return low
+
+    work = xiaola_slot_work(
+        {},
+        None,
+        stop,
+        make_center=lambda _country: IdleCenter(),
+        make_client=lambda: None,
+        wait=wait,
+        randint=randint,
+    )
+    batch = BatchController(3, 10, 15)
+    slot = CountrySlot(1, "PH", batch, work, stop, wait=wait)
+    assert slot.run() == "interrupted"
+    assert bounds == [(7, 15)]
+    assert waits == [7]
+    assert batch.tasks_in_current_batch == 0
+
+
+def test_stop_during_interval_interrupts_without_pulling():
+    stop = threading.Event()
+    pulls = {"n": 0}
+
+    def pull():
+        pulls["n"] += 1
+        return {"code": 0, "data": {"task_id": pulls["n"]}}
+
+    loop = XiaolaSubmitLoop(
+        country="PH",
+        batch=BatchController(3, 10, 15),
+        pull=pull,
+        handle=lambda task: "accepted",
+        stop=stop,
+        wait=lambda _seconds: stop.set() or False,
+    )
+    assert loop.advance() == "pulled"
+    assert loop.advance() == "interrupted"
+    assert loop.advance() == "stopped"
+    assert pulls["n"] == 1

@@ -253,7 +253,7 @@ class UnknownStreak:
 
 
 class XiaolaSubmitLoop:
-    """赢啦提交循环。批次没走完之前不再拉下一单。"""
+    """赢啦提交循环。每拉到一笔，不论结果都计入当前批次，拉下一笔前先等单笔间隔，批满时等批间隔。"""
 
     def __init__(self, *, country: str, batch: BatchController, pull, handle, stop, wait=None):
         self.country = country or ""
@@ -263,18 +263,21 @@ class XiaolaSubmitLoop:
         self.stop = stop
         self.wait = wait or (lambda seconds: wait_or_stop(stop, seconds))
         self.waiting_batch = False
-        self.pending_delay = 0
+        self.pending_delay = None
 
     def advance(self) -> str:
         if self.stop.is_set():
             return "stopped"
-        if self.waiting_batch:
+        if self.pending_delay is not None:
             finished = self.wait(self.pending_delay)
+            self.pending_delay = None
             if not finished or self.stop.is_set():
                 return "interrupted"
-            self.batch.on_batch_interval_completed()
-            self.waiting_batch = False
-            return "batch-gap-done"
+            if self.waiting_batch:
+                self.batch.on_batch_interval_completed()
+                self.waiting_batch = False
+                return "batch-gap-done"
+            return "interval-done"
         if not self.country.strip():
             return "no-country"
         pulled = self.pull()
@@ -282,14 +285,14 @@ class XiaolaSubmitLoop:
             return "idle"
         data = pulled.get("data") or {}
         _note_pulled(logger, data)
-        run_one(self.handle, data, task_id=task_id_of(data), pause=self.wait)
+        # handle 抛错也照样计数、照样等待：单笔间隔本身就是退避，坏任务不会把线程变成紧循环。
+        run_one(self.handle, data, task_id=task_id_of(data))
         delay, batch_full = self.batch.on_task_finished()
         self.pending_delay = delay
-        if batch_full:
-            self.waiting_batch = True
+        self.waiting_batch = batch_full
         return "pulled"
 
 
 def apply_batch_config(batch: BatchController, interval_time, max_tasks_per_batch, batch_interval) -> None:
-    """热更新只换限额。"""
+    """只换限额，不清空当前批计数。生产进程不再热更新批次配置，改配置要重启程序。"""
     batch.replace_limits(interval_time, max_tasks_per_batch, batch_interval)
