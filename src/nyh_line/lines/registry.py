@@ -109,7 +109,10 @@ def _serve_vtsi(line: str, role: str, env, stop: threading.Event) -> None:
     policy = policy_for(line, role)
     center = _make_center(env, line, device_new_profile())
     gateway = VtsiGateway(
-        lambda: zeep_session_factory(env["VTSI_WSDL"], policy.timeout or 50, True),
+        lambda: zeep_session_factory(env["VTSI_WSDL"], policy.timeout or 50),
+        username=env["VTSI_USERNAME"],
+        password=env["VTSI_PASSWORD"],
+        account=env["VTSI_ACCOUNT"],
         timeout=policy.timeout or 50,
     )
     if role == "submit":

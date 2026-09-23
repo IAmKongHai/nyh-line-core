@@ -102,7 +102,13 @@ def test_sigterm_stops_new_pull_and_unknown_result_has_no_feedback():
     transport = FakeTransport()
     center = make_center(transport)
     sink = []
-    gateway = VtsiGateway(lambda: Session(error=TimeoutError("read timeout"), sink=sink), timeout=50)
+    gateway = VtsiGateway(
+        lambda: Session(error=TimeoutError("read timeout"), sink=sink),
+        username="nyh-user",
+        password="pw",
+        account="ACC100",
+        timeout=50,
+    )
     pulls = {"n": 0}
 
     def pull():
@@ -118,7 +124,7 @@ def test_sigterm_stops_new_pull_and_unknown_result_has_no_feedback():
     )
     assert loop.run_round() == "worked"
     assert pulls["n"] == 1
-    assert [item[0] for item in sink] == ["TOPUP"]
+    assert [item["command"] for item in sink] == ["TOPUP"]
     assert actions(transport, "Feedback") == []
     assert len(actions(transport, "SMSContentReceiving")) == 1
     loop.handle_sigterm(signal.SIGTERM, None)

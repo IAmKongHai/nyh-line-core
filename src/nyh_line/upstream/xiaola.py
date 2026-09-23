@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 
@@ -12,6 +13,17 @@ MISSING_PRODUCT = {
     "message": "任务数据中缺少产品代码",
 }
 _LOCAL_ERRORS = {"-1", "-2"}
+
+
+def xiaola_sign(params: dict, secret_key: str) -> str:
+    """参数按键名排序拼成 key=value&...，再追加密钥做 md5。sign 自己不参与。"""
+    filtered = {
+        key: value
+        for key, value in params.items()
+        if value is not None and value != "" and key != "sign"
+    }
+    joined = "&".join(f"{key}={value}" for key, value in sorted(filtered.items()))
+    return hashlib.md5((joined + secret_key).encode("utf-8")).hexdigest()
 
 
 def as_code(value):
@@ -45,7 +57,9 @@ class XiaolaClient:
 
     def _post_once(self, path: str, params: dict) -> dict:
         url = self.base_url + path
-        response = self.transport.post(url, params)
+        signed = dict(params)
+        signed["sign"] = xiaola_sign(signed, self.secret_key)
+        response = self.transport.post(url, signed)
         if response is None:
             return {"error_code": -2, "error_msg": "空响应"}
         try:

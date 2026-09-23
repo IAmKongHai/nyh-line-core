@@ -1,5 +1,6 @@
 """赢啦拦截、缺码、提交和查单回写。"""
 
+import hashlib
 import logging
 
 import pytest
@@ -95,6 +96,29 @@ def test_missing_product_code_feedbacks_without_upstream():
     assert [body["status"] for body in feedbacks] == [3]
     assert "MISSING_PRODUCT_CODE" in feedbacks[0]["api_result"]
     assert len(actions(center_transport, "Template_sending")) == 1
+
+
+def _expected_sign(body: dict, secret_key: str) -> str:
+    fields = {key: value for key, value in body.items() if key != "sign" and value not in (None, "")}
+    joined = "&".join(f"{key}={value}" for key, value in sorted(fields.items()))
+    return hashlib.md5((joined + secret_key).encode("utf-8")).hexdigest()
+
+
+def test_create_query_and_balance_are_signed():
+    upstream, _center_transport, client, center = _clients({"code": 10000, "result": {"balance": "8"}})
+    yingla.submit_task(
+        {"task_id": 7, "phone_number": "9123456789", "content": "P"},
+        center,
+        client,
+        None,
+    )
+    client.query_order("nyh7")
+    client.read_balance()
+    assert len(upstream.calls) == 3
+    for call in upstream.calls:
+        body = call["data"]
+        assert body["sign"] == _expected_sign(body, "secret")
+        assert "secret" not in body
 
 
 def test_upstream_10000_does_not_feedback():

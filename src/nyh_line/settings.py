@@ -16,9 +16,9 @@ CENTER_KEYS = (
 _LINE_KEYS = {
     "fd-globe": ("FD_GLOBE_UID", "FD_GLOBE_KEY", "FD_GLOBE_URL"),
     "fd-smart": ("FD_SMART_UID", "FD_SMART_KEY", "FD_SMART_URL"),
-    "vtsi-dito": ("VTSI_USERNAME", "VTSI_PASSWORD", "VTSI_WSDL"),
-    "vtsi-globe": ("VTSI_USERNAME", "VTSI_PASSWORD", "VTSI_WSDL"),
-    "vtsi-smart": ("VTSI_USERNAME", "VTSI_PASSWORD", "VTSI_WSDL"),
+    "vtsi-dito": ("VTSI_USERNAME", "VTSI_PASSWORD", "VTSI_ACCOUNT", "VTSI_WSDL"),
+    "vtsi-globe": ("VTSI_USERNAME", "VTSI_PASSWORD", "VTSI_ACCOUNT", "VTSI_WSDL"),
+    "vtsi-smart": ("VTSI_USERNAME", "VTSI_PASSWORD", "VTSI_ACCOUNT", "VTSI_WSDL"),
     "xiaola": ("XIAOLA_API_BASE_URL", "XIAOLA_API_USERNAME", "XIAOLA_API_SECRET_KEY", "DEVICE_TYPE_XIAOLA"),
 }
 
