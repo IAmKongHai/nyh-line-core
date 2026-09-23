@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from nyh_line.lines import dito_vtsi, globe_vtsi, smart_vtsi
+
+VTSI_LINES = (dito_vtsi, globe_vtsi, smart_vtsi)
 from nyh_line.upstream.vtsi import (
     CA_FILES,
     VtsiGateway,
@@ -260,6 +262,36 @@ def test_fake_session_signs_topup_and_parses_result_code():
     assert len(sink) == 1
     feedbacks = actions(transport, "Feedback")
     assert [item["status"] for item in feedbacks] == [3]
+
+
+@pytest.mark.parametrize("line", VTSI_LINES)
+def test_line_wrappers_send_authenticated_execute(line):
+    sink = []
+    session = Session(
+        result="<Envelope><Body><ExecuteResponse><resultCode>2</resultCode></ExecuteResponse></Body></Envelope>",
+        sink=sink,
+        session_id="SID42",
+    )
+    gateway = VtsiGateway(
+        lambda: session,
+        username="nyh-user",
+        password="pw",
+        account="ACC100",
+        timeout=10,
+    )
+    center = make_center(FakeTransport())
+    line.submit_task(
+        {"task_id": 9, "phone_number": "9123456789", "vtsi_sku": "SKU1"},
+        center,
+        gateway,
+    )
+    line.check_task({"id": 8, "user_number": "9123456789"}, center, gateway)
+    assert [body["command"] for body in sink] == ["TOPUP", "GETTRANSDETAILSBYMERCHANTID"]
+    for body in sink:
+        assert body["sessionId"] == "SID42"
+        assert body["username"] == "nyh-user"
+        assert body["password"] == hashlib.sha1(b"nyh-userpwSID42").hexdigest()
+        assert body["data"].startswith("<?xml") or "<meta>" in body["data"]
 
 
 def test_fake_session_parses_check_status_from_raw_xml():

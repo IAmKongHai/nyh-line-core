@@ -105,20 +105,21 @@ def _expected_sign(body: dict, secret_key: str) -> str:
 
 
 def test_create_query_and_balance_are_signed():
-    upstream, _center_transport, client, center = _clients({"code": 10000, "result": {"balance": "8"}})
+    upstream, center_transport, client, center = _clients({"code": 10000, "result": {"state": 1, "balance": "8"}})
     yingla.submit_task(
         {"task_id": 7, "phone_number": "9123456789", "content": "P"},
         center,
         client,
         None,
     )
-    client.query_order("nyh7")
+    yingla.check_task({"id": 7, "user_number": "9123456789"}, center, client)
     client.read_balance()
-    assert len(upstream.calls) == 3
+    assert [call["url"].rsplit("/", 1)[-1] for call in upstream.calls] == ["topup", "order", "balance"]
     for call in upstream.calls:
         body = call["data"]
         assert body["sign"] == _expected_sign(body, "secret")
         assert "secret" not in body
+    assert actions(center_transport, "Feedback") == []
 
 
 def test_upstream_10000_does_not_feedback():
