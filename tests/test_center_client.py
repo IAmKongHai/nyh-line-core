@@ -2,10 +2,12 @@
 
 import hashlib
 import json
+import logging
 
 import pytest
 
 from nyh_line.center.clean import clean_api_result
+from nyh_line.center.client import is_bad_sign
 from nyh_line.center.profiles import device_new_profile, xiaola_profile
 from tests.support import FakeResponse, FakeTransport, actions, make_center, make_xiaola_center
 
@@ -163,3 +165,40 @@ def test_unreadable_response_is_a_single_post(broken):
     client = make_center(transport)
     client.get_task()
     assert len(transport.calls) == 1
+
+
+# ---- 验签失败与「没有单」分开（Center 在 data.type 标 badSign） ----
+
+BAD_SIGN = {"code": 120, "msg": "请求资源不存在", "data": {"type": "badSign"}}
+
+
+@pytest.mark.parametrize("call", ["get_task", "in_executing_tasks"])
+def test_bad_sign_logs_error_with_action(call, caplog):
+    caplog.set_level(logging.INFO)
+    center = make_center(FakeTransport(response=BAD_SIGN))
+    result = getattr(center, call)()
+    assert result["code"] == 120
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "验签失败" in errors[0] and "设备密钥" in errors[0]
+    assert "device-key" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"code": 120, "msg": "没有符合条件的任务", "data": ""},
+        {"code": 120, "msg": "empty"},
+        {"code": 6003, "msg": "该运营商没有待发送任务", "data": {"type": "noTask"}},
+    ],
+)
+def test_no_task_120_stays_quiet(payload, caplog):
+    caplog.set_level(logging.INFO)
+    make_center(FakeTransport(response=payload)).get_task()
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_is_bad_sign_accepts_string_code():
+    assert is_bad_sign({"code": "120", "data": {"type": "badSign"}})
+    assert not is_bad_sign({"code": 0, "data": {"type": "badSign"}})
+    assert not is_bad_sign(None)

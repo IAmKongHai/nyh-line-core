@@ -77,7 +77,10 @@ class CenterClient:
         except Exception as exc:
             logger.error("Center 请求失败 action=%s error=%s", body.get("action"), type(exc).__name__)
             return {"code": -1, "msg": "网络请求失败"}
-        return self._read_json(response)
+        result = self._read_json(response)
+        if is_bad_sign(result):
+            logger.error("Center 验签失败 action=%s，检查本线路的设备号和设备密钥", body.get("action"))
+        return result
 
     def _read_json(self, response) -> dict:
         if response is None:
@@ -156,6 +159,14 @@ class CenterClient:
             if _code_of(last) != "0":
                 logger.warning("模板发送失败 task_id=%s user_id=%s code=%s", task_id, user_id, _code_of(last))
         return last
+
+
+def is_bad_sign(result) -> bool:
+    """Center 验签失败返回 code 120 且 data.type 为 badSign。没有任务时的 120 不带这个标记。"""
+    if not isinstance(result, dict) or str(result.get("code")) != "120":
+        return False
+    data = result.get("data")
+    return isinstance(data, dict) and data.get("type") == "badSign"
 
 
 def _code_of(result) -> str:
