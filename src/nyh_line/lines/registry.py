@@ -37,7 +37,7 @@ from nyh_line.settings import (
     xiaola_submit_settings,
 )
 from nyh_line.upstream.fd import FdClient
-from nyh_line.upstream.vtsi import VtsiGateway, parse_wallet_balance, zeep_session_factory
+from nyh_line.upstream.vtsi import VtsiGateway, parse_wallet_balance, publish_ca_bundle, zeep_session_factory
 from nyh_line.upstream.xiaola import XiaolaClient, parse_xiaola_balance
 from nyh_line.xiaola.batch import BatchController
 from nyh_line.xiaola.blocklist import Blocklist
@@ -131,16 +131,25 @@ def _serve_fd(line: str, env, stop: threading.Event) -> None:
         loop.run_round()
 
 
-def _serve_vtsi(line: str, role: str, env, stop: threading.Event) -> None:
+def build_vtsi_gateway(line: str, role: str, env, ca_path: str) -> VtsiGateway:
+    """按线路策略组 VTSI 网关：超时同时管 WSDL 和 SOAP 调用，提交侧带发送截止。"""
     policy = policy_for(line, role)
-    center = _make_center(env, line, device_new_profile())
-    gateway = VtsiGateway(
-        lambda: zeep_session_factory(env["VTSI_WSDL"], policy.timeout or 50),
+    timeout = policy.timeout or 50
+    return VtsiGateway(
+        zeep_session_factory(env["VTSI_WSDL"], timeout, ca_path),
         username=env["VTSI_USERNAME"],
         password=env["VTSI_PASSWORD"],
         account=env[vtsi_account_key(line)],
-        timeout=policy.timeout or 50,
+        timeout=timeout,
+        send_deadline=policy.send_deadline,
     )
+
+
+def _serve_vtsi(line: str, role: str, env, stop: threading.Event) -> None:
+    policy = policy_for(line, role)
+    center = _make_center(env, line, device_new_profile())
+    # 主线程在起工作线程前生成一次 CA 包，之后所有会话都用这个固定路径。
+    gateway = build_vtsi_gateway(line, role, env, publish_ca_bundle())
     if role == "submit":
         submit = _VTSI_SUBMIT[line]
 

@@ -1,11 +1,15 @@
 """VTSI 三条线路的提交、查单、短信和 TOPUP 次数。"""
 
 import hashlib
+import logging
+import threading
 from pathlib import Path
 
 import pytest
+import requests
 
-from nyh_line.lines import dito_vtsi, globe_vtsi, smart_vtsi
+from nyh_line.lines import dito_vtsi, globe_vtsi, registry, smart_vtsi
+from nyh_line.upstream import vtsi as vtsi_module
 
 VTSI_LINES = (dito_vtsi, globe_vtsi, smart_vtsi)
 from nyh_line.upstream.vtsi import (
@@ -166,11 +170,18 @@ def test_session_create_can_retry_but_topup_runs_once():
 
 
 def test_each_command_opens_a_new_session():
+    """工厂内部可以复用 client，但每条命令前都要 CreateSession 一次。"""
     opened = {"n": 0}
 
+    class Counted(Session):
+        def create_session(self, username):
+            opened["n"] += 1
+            return super().create_session(username)
+
+    shared = Counted(result=soap("2"))
+
     def factory():
-        opened["n"] += 1
-        return Session(result=soap("2"))
+        return shared
 
     gateway = VtsiGateway(
         factory,
@@ -425,3 +436,240 @@ def test_wallet_balance_parser_rejects_missing_wallet():
     assert parse_wallet_balance(
         {"Body": {"ExecuteResponse": {"return": "<root><wallet><balance>12</balance></wallet></root>"}}}
     ) == "12"
+
+
+# ---- 长时间运行：CA 固定路径、client 按线程复用、超时、发送截止（U3） ----
+
+
+def test_ca_bundle_published_ten_times_leaves_one_file(tmp_path):
+    target = tmp_path / "var" / "vtsi-ca-bundle.pem"
+    paths = {vtsi_module.publish_ca_bundle(target) for _ in range(10)}
+    assert paths == {str(target)}
+    assert sorted(path.name for path in target.parent.iterdir()) == ["vtsi-ca-bundle.pem"]
+    text = target.read_text(encoding="utf-8")
+    for name in CA_FILES:
+        assert (repo_cert_dir() / name).read_text(encoding="utf-8").strip() in text
+
+
+class _CountingZeep:
+    """替换 zeep.Client 和 Transport，记录构造次数和超时参数。"""
+
+    def __init__(self, fail_first=False):
+        self.clients = 0
+        self.transports = []
+        self.fail_first = fail_first
+        create_xml = (
+            "<Envelope><Body><CreateSessionResponse>"
+            "<resultCode>2</resultCode><sessionId>SID9</sessionId>"
+            "</CreateSessionResponse></Body></Envelope>"
+        )
+        execute_xml = "<Envelope><Body><ExecuteResponse><resultCode>2</resultCode></ExecuteResponse></Body></Envelope>"
+        self.fakes = []
+        self.xml = (execute_xml, create_xml)
+
+    def client(self, wsdl, transport=None):
+        self.clients += 1
+        if self.fail_first and self.clients == 1:
+            raise requests.ConnectionError("wsdl down")
+        fake = _FakeZeepClient(*self.xml)
+        self.fakes.append(fake)
+        return fake
+
+    def transport(self, **kwargs):
+        self.transports.append(kwargs)
+        return object()
+
+
+def _patched_factory(monkeypatch, tmp_path, line="vtsi-dito", fail_first=False):
+    import zeep
+    import zeep.transports
+
+    counting = _CountingZeep(fail_first=fail_first)
+    monkeypatch.setattr(zeep, "Client", counting.client)
+    monkeypatch.setattr(zeep.transports, "Transport", counting.transport)
+    ca_path = vtsi_module.publish_ca_bundle(tmp_path / "ca.pem")
+    gateway = registry.build_vtsi_gateway(line, "submit", _env_for(line), ca_path)
+    return counting, gateway
+
+
+def _create_session_calls(counting):
+    return sum(1 for fake in counting.fakes for call in fake.calls if call[0] == "CreateSession")
+
+
+def test_client_built_once_per_thread_and_session_per_command(monkeypatch, tmp_path):
+    counting, gateway = _patched_factory(monkeypatch, tmp_path)
+    for _ in range(3):
+        gateway.execute("GETWALLETBALANCE", {"accountNo": "ACC100"}, normalize=False)
+    assert counting.clients == 1
+    assert _create_session_calls(counting) == 3
+
+
+def test_two_threads_build_two_clients(monkeypatch, tmp_path):
+    counting, gateway = _patched_factory(monkeypatch, tmp_path)
+    threads = [threading.Thread(target=gateway.query, args=("v1",)) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert counting.clients == 2
+
+
+def test_failed_client_build_is_not_cached(monkeypatch, tmp_path):
+    counting, gateway = _patched_factory(monkeypatch, tmp_path, fail_first=True)
+    gateway.query("v1")
+    gateway.query("v2")
+    assert counting.clients == 2
+    assert _create_session_calls(counting) == 2
+
+
+@pytest.mark.parametrize("line,seconds", [("vtsi-smart", 10), ("vtsi-globe", 50), ("vtsi-dito", 50)])
+def test_transport_sets_wsdl_and_operation_timeout(monkeypatch, tmp_path, line, seconds):
+    counting, gateway = _patched_factory(monkeypatch, tmp_path, line=line)
+    gateway.query("v1")
+    assert counting.transports[0]["timeout"] == seconds
+    assert counting.transports[0]["operation_timeout"] == seconds
+    assert gateway.send_deadline == 15
+    check_gateway = registry.build_vtsi_gateway(line, "check", _env_for(line), "ca.pem")
+    assert check_gateway.send_deadline is None
+
+
+def _env_for(line):
+    return {
+        "VTSI_WSDL": "https://vtsi.invalid/ws?wsdl",
+        "VTSI_USERNAME": "nyh-user",
+        "VTSI_PASSWORD": "pw",
+        f"{line.upper().replace('-', '_')}_ACCOUNT": "ACC100",
+    }
+
+
+def test_topup_read_timeout_is_transport_failed_without_resend():
+    outcome, transport, sink = _submit("dito", error=requests.ReadTimeout("read timed out"))
+    assert outcome == "transport-failed"
+    assert actions(transport, "Feedback") == []
+    assert [item["command"] for item in sink] == ["TOPUP"]
+
+
+def test_check_sms_uses_center_number_as_is():
+    _outcome, transport, _sink = _check(soap("2", "2"))
+    sms = actions(transport, "SMSContentReceiving")
+    assert [body["reception_number"] for body in sms] == ["9123456789"]
+
+
+def test_submit_still_sends_leading_zero():
+    _outcome, transport, sink = _submit("dito", soap("2"))
+    assert "<mobileNo>09123456789</mobileNo>" in sink[0]["data"]
+    assert {body["reception_number"] for body in actions(transport, "SMSContentReceiving")} == {"09123456789"}
+
+
+class _Clock:
+    """单调时钟。每次 CreateSession 之后按脚本前进。"""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class _ClockSession(Session):
+    def __init__(self, clock, advance, fail_times=0, **kwargs):
+        super().__init__(**kwargs)
+        self.clock = clock
+        self.advance = advance
+        self.fail_times = fail_times
+        self.creates = 0
+
+    def create_session(self, username):
+        self.creates += 1
+        self.clock.now += self.advance
+        if self.creates <= self.fail_times:
+            raise RuntimeError("session down")
+        return self.session_id
+
+
+def _deadline_submit(session, clock, caplog):
+    caplog.set_level(logging.ERROR)
+    gateway = VtsiGateway(
+        lambda: session,
+        username="nyh-user",
+        password="pw",
+        account="ACC100",
+        timeout=50,
+        send_deadline=15,
+        monotonic=clock,
+    )
+    transport = FakeTransport()
+    outcome = dito_vtsi.submit_task(
+        {"task_id": 9, "phone_number": "9123456789", "vtsi_sku": "SKU1"}, make_center(transport), gateway
+    )
+    return outcome, transport
+
+
+def test_deadline_passed_after_session_skips_topup(caplog):
+    clock = _Clock()
+    sink = []
+    session = _ClockSession(clock, advance=16, result=soap("2"), sink=sink)
+    outcome, transport = _deadline_submit(session, clock, caplog)
+    assert outcome == "deadline-missed"
+    assert sink == []
+    assert actions(transport, "Feedback") == []
+    assert len(actions(transport, "SMSContentReceiving")) == 1
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1 and "task_id=9" in errors[0].getMessage()
+
+
+def test_deadline_stops_session_retries(caplog):
+    clock = _Clock()
+    sink = []
+    session = _ClockSession(clock, advance=15, fail_times=1, result=soap("2"), sink=sink)
+    outcome, _transport = _deadline_submit(session, clock, caplog)
+    assert outcome == "deadline-missed"
+    assert session.creates == 1
+    assert sink == []
+
+
+def test_topup_sent_before_deadline_waits_for_timeout(caplog):
+    clock = _Clock()
+    sink = []
+
+    class SlowSession(_ClockSession):
+        def execute(self, request_map):
+            self.sink.append(request_map)
+            self.clock.now += 30
+            raise requests.ReadTimeout("read timed out")
+
+    session = SlowSession(clock, advance=14, sink=sink)
+    outcome, transport = _deadline_submit(session, clock, caplog)
+    assert outcome == "transport-failed"
+    assert [item["command"] for item in sink] == ["TOPUP"]
+    assert actions(transport, "Feedback") == []
+
+
+def test_query_and_balance_ignore_send_deadline():
+    clock = _Clock()
+    sink = []
+    session = _ClockSession(clock, advance=100, result=soap("2", "2"), sink=sink)
+    gateway = VtsiGateway(
+        lambda: session, username="u", password="p", account="ACC100", timeout=50, send_deadline=15, monotonic=clock
+    )
+    gateway.query("v1")
+    gateway.balance()
+    assert [item["command"] for item in sink] == ["GETTRANSDETAILSBYMERCHANTID", "GETWALLETBALANCE"]
+
+
+def test_configuring_sessions_repeatedly_does_not_accumulate_files(tmp_path, monkeypatch):
+    """本地复现：每配置一次会话就多一个 CA 临时文件。修复后只有固定路径一个文件。"""
+    import tempfile
+
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    monkeypatch.setattr(vtsi_module, "ca_bundle_path", lambda: tmp_path / "var" / "vtsi-ca-bundle.pem", raising=False)
+
+    class Http:
+        verify = None
+
+    for _ in range(10):
+        configure_http_session(Http())
+    files = [path for path in tmp_path.rglob("*") if path.is_file()]
+    assert len(files) == 1

@@ -5,11 +5,19 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import logging
+import os
 import tempfile
+import threading
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import xmltodict
+
+from nyh_line.errors import SendDeadlineMissed
+
+logger = logging.getLogger(__name__)
 
 TOPUP_COMMAND = "TOPUP"
 RESULT_COMMAND = "GETTRANSDETAILSBYMERCHANTID"
@@ -22,6 +30,11 @@ CA_FILES = (
 
 def repo_cert_dir() -> Path:
     return Path(__file__).resolve().parents[3] / "certs"
+
+
+def ca_bundle_path() -> Path:
+    """合并后的 CA 包放在仓库内被忽略的固定位置，六个 VTSI 程序共用。"""
+    return Path(__file__).resolve().parents[3] / "var" / "vtsi-ca-bundle.pem"
 
 
 def sha1_hex(text: str) -> str:
@@ -85,25 +98,37 @@ def normalize_execute_result(parsed: dict) -> dict:
     return parsed
 
 
-def combined_ca_bundle() -> str:
-    """certifi 加上仓库里的两张 GoDaddy 公共 CA。校验不能只开系统默认。"""
+def publish_ca_bundle(target: Path | None = None) -> str:
+    """certifi 加上仓库里的两张 GoDaddy 公共 CA，原子写到固定路径。
+
+    先写同目录临时文件再 os.replace：别的 VTSI 进程新建 TLS 连接时，只会读到完整的旧文件或新文件。
+    进程启动时由主线程调用一次，重复调用也只保留这一个文件。
+    """
     import certifi
 
+    target = Path(target) if target is not None else ca_bundle_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
     sources = [Path(certifi.where())]
     sources.extend(repo_cert_dir() / name for name in CA_FILES)
-    handle = tempfile.NamedTemporaryFile("w", prefix="nyh-line-ca-", suffix=".pem", delete=False)
-    with handle:
-        for path in sources:
-            data = path.read_text(encoding="utf-8")
-            if data and not data.endswith("\n"):
-                data += "\n"
-            handle.write(data)
-    return handle.name
+    descriptor, staging = tempfile.mkstemp(prefix=".ca-", suffix=".pem", dir=target.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            for path in sources:
+                data = path.read_text(encoding="utf-8")
+                if data and not data.endswith("\n"):
+                    data += "\n"
+                handle.write(data)
+        os.chmod(staging, 0o644)
+        os.replace(staging, target)
+    except BaseException:
+        Path(staging).unlink(missing_ok=True)
+        raise
+    return str(target)
 
 
-def configure_http_session(http):
-    """把仓库 CA 挂到 requests 会话上。"""
-    http.verify = combined_ca_bundle()
+def configure_http_session(http, ca_path: str | None = None):
+    """把仓库 CA 挂到 requests 会话上。未给路径时现场发布一次固定路径的 CA 包。"""
+    http.verify = ca_path or publish_ca_bundle(ca_bundle_path())
     return http
 
 
@@ -174,6 +199,8 @@ class VtsiGateway:
         timeout: float,
         session_attempts: int = 3,
         clock=None,
+        send_deadline: float | None = None,
+        monotonic=None,
     ):
         self.session_factory = session_factory
         self.username = username
@@ -182,10 +209,24 @@ class VtsiGateway:
         self.timeout = timeout
         self.session_attempts = session_attempts
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
+        # TOPUP 必须在拉到任务后这么多秒内发出，None 表示不限。只管 TOPUP，不管查单和余额。
+        self.send_deadline = send_deadline
+        self.monotonic = monotonic or time.monotonic
 
-    def _open_authenticated_session(self):
+    def topup_deadline(self) -> float | None:
+        """从现在起算的 TOPUP 发送截止时刻。提交函数在拉到任务后立刻调用。"""
+        if not self.send_deadline:
+            return None
+        return self.monotonic() + self.send_deadline
+
+    def _check_deadline(self, deadline) -> None:
+        if deadline is not None and self.monotonic() >= deadline:
+            raise SendDeadlineMissed("TOPUP 发送截止时间已过")
+
+    def _open_authenticated_session(self, deadline=None):
         last_error = None
         for _ in range(self.session_attempts):
+            self._check_deadline(deadline)
             try:
                 session = self.session_factory()
                 session_id = session.create_session(self.username)
@@ -196,8 +237,10 @@ class VtsiGateway:
             raise RuntimeError("无法创建 VTSI 会话")
         raise last_error
 
-    def execute(self, command: str, meta: dict, *, normalize: bool = True):
-        session, session_id = self._open_authenticated_session()
+    def execute(self, command: str, meta: dict, *, normalize: bool = True, deadline=None):
+        session, session_id = self._open_authenticated_session(deadline)
+        # 发出前最后一次检查。一旦 Execute 已发出，就等操作超时，不中途撤回。
+        self._check_deadline(deadline)
         body = build_authenticated_execute(
             command,
             meta,
@@ -211,7 +254,7 @@ class VtsiGateway:
             return normalize_execute_result(parsed)
         return parsed
 
-    def topup(self, *, merchant_transaction_id: str, phone: str, sku: str):
+    def topup(self, *, merchant_transaction_id: str, phone: str, sku: str, deadline=None):
         moment = self.clock()
         merchant_date = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
         return self.execute(
@@ -222,6 +265,7 @@ class VtsiGateway:
                 "mobileNo": phone,
                 "sku": sku,
             },
+            deadline=deadline,
         )
 
     def query(self, merchant_transaction_id: str):
@@ -267,15 +311,30 @@ class SoapSession:
         return parse_soap_response(response)
 
 
-def zeep_session_factory(wsdl: str, timeout: float):
-    """打开 WSDL 并挂上仓库 CA。测试不调用这里。Execute 只发一次。"""
-    import requests
-    import zeep
-    from zeep.transports import Transport
+def zeep_session_factory(wsdl: str, timeout: float, ca_path: str):
+    """返回会话工厂。每个线程第一次调用时打开 WSDL，之后复用这个线程的 client。
 
-    http = configure_http_session(requests.Session())
-    client = zeep.Client(wsdl, transport=Transport(session=http, timeout=timeout))
-    return SoapSession(client)
+    zeep 的 Transport 和 requests.Session 都不保证线程安全，所以按线程缓存。
+    只有 WSDL 加载成功才缓存，失败交给网关的会话重试。
+    timeout 管 WSDL 加载，operation_timeout 管每次 SOAP 调用，两者取同一个值。
+    """
+    local = threading.local()
+
+    def factory() -> SoapSession:
+        cached = getattr(local, "session", None)
+        if cached is not None:
+            return cached
+        import requests
+        import zeep
+        import zeep.transports
+
+        http = configure_http_session(requests.Session(), ca_path)
+        transport = zeep.transports.Transport(session=http, timeout=timeout, operation_timeout=timeout)
+        session = SoapSession(zeep.Client(wsdl, transport=transport))
+        local.session = session
+        return session
+
+    return factory
 
 
 def _sms(center, content, phone: str, task_id) -> None:
@@ -285,6 +344,8 @@ def _sms(center, content, phone: str, task_id) -> None:
 
 def submit_vtsi_task(task: dict, center, gateway: VtsiGateway, *, terminal_fail: set[str]) -> str:
     """提交前写一条短信，拿到响应再写一条。两条都不看 resultCode。"""
+    # 发送截止从拉到任务起算，会话重试的耗时也算在内。
+    deadline = gateway.topup_deadline()
     task_id = task["task_id"]
     phone = "0" + str(task["phone_number"])
     merchant_id = "v" + str(task_id)
@@ -299,7 +360,11 @@ def submit_vtsi_task(task: dict, center, gateway: VtsiGateway, *, terminal_fail:
             merchant_transaction_id=merchant_id,
             phone=phone,
             sku=task.get("vtsi_sku"),
+            deadline=deadline,
         )
+    except SendDeadlineMissed:
+        logger.error("VTSI 拉单后 %s 秒内没发出 TOPUP，放弃这一笔，交给查单 task_id=%s", gateway.send_deadline, task_id)
+        return "deadline-missed"
     except Exception:
         return "transport-failed"
     _sms(center, result, phone, task_id)
@@ -329,8 +394,8 @@ def check_vtsi_task(record: dict, center, gateway: VtsiGateway) -> str:
         return "rollback"
     if code != "2":
         return "ignore"
-    phone = "0" + str(record.get("user_number", ""))
-    _sms(center, result, phone, task_id)
+    # 查单的短信接收用 Center 下发的原号，与旧三条查单一致。
+    _sms(center, result, str(record.get("user_number", "")), task_id)
     status_code = status_code_of(result)
     mapped = _CHECK_TERMINAL.get(status_code)
     if mapped is None:

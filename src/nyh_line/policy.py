@@ -19,6 +19,8 @@ class LinePolicy:
     # 菲岛：连续这么多笔结果未知就暂停拉单。0 表示不暂停。
     unknown_pause_after: int = 0
     unknown_pause_seconds: float = 0
+    # VTSI 提交：拉到任务后这么多秒内没发出 TOPUP 就放弃。给 Center 的 20 秒查单延迟留 5 秒余量。
+    send_deadline: float | None = None
 
 
 # 无任务时的等待按现有进程保留，不收成一个数。
@@ -29,11 +31,11 @@ _POLICIES = {
     ("fd-smart", "submit"): LinePolicy(
         "fd-smart", "submit", 1, 7, 15, False, unknown_pause_after=3, unknown_pause_seconds=60
     ),
-    ("vtsi-dito", "submit"): LinePolicy("vtsi-dito", "submit", 1, 7, 15, True, timeout=50),
+    ("vtsi-dito", "submit"): LinePolicy("vtsi-dito", "submit", 1, 7, 15, True, timeout=50, send_deadline=15),
     ("vtsi-dito", "check"): LinePolicy("vtsi-dito", "check", 1, 7, 15, True, timeout=50, busy_sleep=0.2),
-    ("vtsi-globe", "submit"): LinePolicy("vtsi-globe", "submit", 4, 30, 60, True, timeout=50),
+    ("vtsi-globe", "submit"): LinePolicy("vtsi-globe", "submit", 4, 30, 60, True, timeout=50, send_deadline=15),
     ("vtsi-globe", "check"): LinePolicy("vtsi-globe", "check", 1, 15, 30, True, timeout=50),
-    ("vtsi-smart", "submit"): LinePolicy("vtsi-smart", "submit", 2, 7, 15, True, timeout=10),
+    ("vtsi-smart", "submit"): LinePolicy("vtsi-smart", "submit", 2, 7, 15, True, timeout=10, send_deadline=15),
     ("vtsi-smart", "check"): LinePolicy("vtsi-smart", "check", 1, 7, 15, True, timeout=10),
     ("xiaola", "submit"): LinePolicy("xiaola", "submit", 1, 7, 15, True, busy_sleep=0.2),
     ("xiaola", "check"): LinePolicy("xiaola", "check", 1, 7, 15, True, busy_sleep=0.5),
