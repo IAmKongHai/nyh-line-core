@@ -46,10 +46,20 @@ class PollLoop:
             self._note_idle(code)
             self.sleep(self.randint(self.policy.idle_low, self.policy.idle_high))
             return "idle"
-        self.handle(pulled.get("data") or {})
+        data = pulled.get("data") or {}
+        _note_pulled(self.log, data)
+        self.handle(data)
         if self.policy.busy_sleep:
             self.sleep(self.policy.busy_sleep)
         return "worked"
+
+
+def _note_pulled(log, data) -> None:
+    """提交拉到一笔时记 task_id 和手机号；查单拉到一批时记条数。"""
+    if isinstance(data, dict):
+        log.info("拉到任务 task_id=%s phone=%s", data.get("task_id"), data.get("phone_number"))
+    elif isinstance(data, list):
+        log.info("取到执行中记录 %s 条", len(data))
 
 
 def install_signals(loop: PollLoop) -> None:
@@ -153,7 +163,9 @@ class XiaolaSubmitLoop:
         pulled = self.pull()
         if not isinstance(pulled, dict) or str(pulled.get("code")) != "0":
             return "idle"
-        self.handle(pulled.get("data") or {})
+        data = pulled.get("data") or {}
+        _note_pulled(logger, data)
+        self.handle(data)
         delay, batch_full = self.batch.on_task_finished()
         self.pending_delay = delay
         if batch_full:

@@ -74,8 +74,8 @@ class CenterClient:
         body["sign"] = self.signature(body["action"], body["time"])
         try:
             response = self.transport.post(url, body)
-        except Exception:
-            logger.error("Center 请求失败 action=%s", body.get("action"))
+        except Exception as exc:
+            logger.error("Center 请求失败 action=%s error=%s", body.get("action"), type(exc).__name__)
             return {"code": -1, "msg": "网络请求失败"}
         return self._read_json(response)
 
@@ -113,7 +113,11 @@ class CenterClient:
                 )
             except Exception:
                 logger.error("运营商响应序列化失败，跳过 api_result task_id=%s", task_id)
-        return self._sign_and_post(self._url(self.profile.feedback_path), body)
+        result = self._sign_and_post(self._url(self.profile.feedback_path), body)
+        code = _code_of(result)
+        level = logging.INFO if code == "0" else logging.WARNING
+        logger.log(level, "Feedback task_id=%s status=%s code=%s", task_id, status, code)
+        return result
 
     def in_executing_tasks(self) -> dict:
         """取执行中的发送行。VTSI 和赢啦都走 VTSI 口。"""
@@ -132,7 +136,10 @@ class CenterClient:
         body["body"] = body_text
         body["reception_number"] = reception_number
         body["task_id"] = task_id
-        return self._sign_and_post(self._url(self.profile.feedback_path), body)
+        result = self._sign_and_post(self._url(self.profile.feedback_path), body)
+        if _code_of(result) != "0":
+            logger.warning("短信接收写入失败 task_id=%s code=%s", task_id, _code_of(result))
+        return result
 
     def send_template(self, task_id, code) -> dict:
         """按本线路配置的收件人各发一条模板。收件人为空则不发。"""
@@ -146,4 +153,11 @@ class CenterClient:
             body["keyword3"] = ""
             body["remark"] = f"错误编号:{code}"
             last = self._sign_and_post(self._url(self.profile.feedback_path), body)
+            if _code_of(last) != "0":
+                logger.warning("模板发送失败 task_id=%s user_id=%s code=%s", task_id, user_id, _code_of(last))
         return last
+
+
+def _code_of(result) -> str:
+    """Center 返回的 code 收成文本，便于比较和记日志。"""
+    return str(result.get("code")) if isinstance(result, dict) else "-1"

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
+
+from nyh_line.log_setup import log_safe
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +103,12 @@ def submit_xiaola_task(task: dict, center, client: XiaolaClient, blocklist) -> s
     task_id = task["task_id"]
     phone = str(task.get("phone_number", ""))
     if blocklist is not None and blocklist.is_blocked(phone):
+        logger.info("赢啦号码在拦截名单，回写 3 task_id=%s phone=%s", task_id, phone)
         center.feedback(task_id, 3)
         return "blocked"
     product_code = task.get("content")
     if product_code in (None, ""):
+        logger.warning("赢啦任务缺产品代码，回写 3 task_id=%s", task_id)
         center.feedback(task_id, 3, dict(MISSING_PRODUCT))
         center.send_template(task_id, "MISSING_PRODUCT_CODE")
         return "missing-product"
@@ -117,10 +120,13 @@ def submit_xiaola_task(task: dict, center, client: XiaolaClient, blocklist) -> s
             product_code=product_code,
             recharge_no=recharge_no,
         )
-    except Exception:
+    except Exception as exc:
+        logger.error("赢啦下单结果未知，不回写 task_id=%s error=%s", task_id, type(exc).__name__)
         return "transport-failed"
     if not isinstance(result, dict) or _is_local_sentinel(result) or as_code(result.get("code")) is None:
+        logger.error("赢啦下单结果未知，不回写 task_id=%s resp=%s", task_id, log_safe(result))
         return "unknown"
+    logger.info("赢啦下单 task_id=%s code=%s resp=%s", task_id, result.get("code"), log_safe(result))
     if as_code(result.get("code")) == "10000":
         return "accepted"
     center.feedback(task_id, 0, result)
@@ -134,18 +140,20 @@ def check_xiaola_task(record: dict, center, client: XiaolaClient) -> str:
     user_order_no = "nyh" + str(task_id)
     try:
         result = client.query_order(user_order_no)
-    except Exception:
+    except Exception as exc:
+        logger.warning("赢啦查单失败 task_id=%s error=%s", task_id, type(exc).__name__)
         return "transport-failed"
     if not isinstance(result, dict):
         return "unknown"
     code = as_code(result.get("code"))
+    state_node = result.get("result")
+    state_value = state_node.get("state") if isinstance(state_node, dict) else None
+    logger.info("赢啦查单 task_id=%s code=%s state=%s", task_id, code, state_value)
     if code in {"10005", "10006"}:
         center.feedback(task_id, 0, result)
         return "rollback"
     if code != "10000":
         return "ignore"
-    state_node = result.get("result")
-    state_value = state_node.get("state") if isinstance(state_node, dict) else None
     state = as_code(state_value)
     if state == "1":
         return "pending"

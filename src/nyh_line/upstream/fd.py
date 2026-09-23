@@ -6,6 +6,7 @@ import hashlib
 import logging
 
 from nyh_line.errors import RequestNotSent
+from nyh_line.log_setup import log_safe
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ def submit_fd_task(task: dict, center, client: FdClient, *, notify: bool, on_unk
     task_id = task.get("task_id")
     money = money_as_int(task.get("fd_content_money"))
     if missing or money is None:
+        logger.warning("菲岛任务字段不全或金额不是整数，回写 0 task_id=%s missing=%s", task_id, ",".join(missing))
         center.feedback(task_id, 0)
         if notify:
             _notify(center, task_id, "MISSING_FIELD")
@@ -108,7 +110,8 @@ def submit_fd_task(task: dict, center, client: FdClient, *, notify: bool, on_unk
             money=money,
             order_id=task_id,
         )
-    except RequestNotSent:
+    except RequestNotSent as exc:
+        logger.warning("菲岛下单没发出，回写 0 task_id=%s reason=%s", task_id, exc)
         center.feedback(task_id, 0)
         if notify:
             _notify(center, task_id, "NOT_SENT")
@@ -121,6 +124,7 @@ def submit_fd_task(task: dict, center, client: FdClient, *, notify: bool, on_unk
         if on_unknown is not None:
             on_unknown(reason)
         return "unknown"
+    logger.info("菲岛下单 task_id=%s code=%s resp=%s", task_id, code, log_safe(result))
     if str(code) == "0000":
         maintaining = result.get("success") is False and result.get("message") == MAINTENANCE_MESSAGE
         if not maintaining:

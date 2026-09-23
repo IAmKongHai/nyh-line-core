@@ -365,10 +365,12 @@ def submit_vtsi_task(task: dict, center, gateway: VtsiGateway, *, terminal_fail:
     except SendDeadlineMissed:
         logger.error("VTSI 拉单后 %s 秒内没发出 TOPUP，放弃这一笔，交给查单 task_id=%s", gateway.send_deadline, task_id)
         return "deadline-missed"
-    except Exception:
+    except Exception as exc:
+        logger.error("VTSI TOPUP 结果未知，不回写 task_id=%s error=%s", task_id, type(exc).__name__)
         return "transport-failed"
     _sms(center, result, phone, task_id)
     code = result_code_of(result)
+    logger.info("VTSI TOPUP task_id=%s resultCode=%s", task_id, code)
     if code is None or code == "2":
         return "accepted" if code == "2" else "missing-code"
     status = 3 if code in terminal_fail else 0
@@ -386,9 +388,11 @@ def check_vtsi_task(record: dict, center, gateway: VtsiGateway) -> str:
     merchant_id = "v" + str(task_id)
     try:
         result = gateway.query(merchant_id)
-    except Exception:
+    except Exception as exc:
+        logger.warning("VTSI 查单失败 task_id=%s error=%s", task_id, type(exc).__name__)
         return "transport-failed"
     code = result_code_of(result)
+    logger.info("VTSI 查单 task_id=%s resultCode=%s statusCode=%s", task_id, code, status_code_of(result))
     if code == "25":
         center.feedback(task_id, 0, result)
         return "rollback"

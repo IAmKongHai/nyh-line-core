@@ -12,6 +12,7 @@ from nyh_line.balance import BalanceGate
 from nyh_line.center.client import CenterClient
 from nyh_line.center.profiles import device_new_profile, xiaola_profile
 from nyh_line.http_transport import requests_transport
+from nyh_line.log_setup import configure_logging
 from nyh_line.lines import dito_vtsi, globe_fd, globe_vtsi, smart_fd, smart_vtsi, yingla
 from nyh_line.policy import known_role, policy_for
 from nyh_line.runner import (
@@ -301,6 +302,8 @@ def run_line(line: str, role: str, env=None, serve=None) -> int:
         for problem in problems:
             print(problem, file=sys.stderr)
         return 2
+    configure_logging()
+    logger.info("启动 %s %s", line, role)
     runner = serve or serve_forever
     runner(line, role, current)
     return 0
