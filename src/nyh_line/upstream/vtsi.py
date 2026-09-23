@@ -238,31 +238,44 @@ class VtsiGateway:
         )
 
 
+def session_id_from_create(raw) -> str:
+    """从 CreateSession 的原始 XML 取出 sessionId。结果码不是 2 就失败。"""
+    parsed = parse_soap_response(raw)
+    created = parsed.get("Body", {}).get("CreateSessionResponse", {})
+    if not isinstance(created, dict):
+        raise RuntimeError("获取 session 失败")
+    session_id = created.get("sessionId")
+    if as_code(created.get("resultCode")) != "2" or not session_id:
+        raise RuntimeError("获取 session 失败")
+    return str(session_id)
+
+
+class SoapSession:
+    """生产 SOAP 会话。Execute 的原始 XML 在这里收成 dict，不把 zeep 对象交给回写。"""
+
+    def __init__(self, client):
+        self.client = client
+
+    def create_session(self, username: str) -> str:
+        with self.client.settings(raw_response=True):
+            response = self.client.service.CreateSession(username=username)
+        return session_id_from_create(response)
+
+    def execute(self, request_map: dict):
+        with self.client.settings(raw_response=True):
+            response = self.client.service.Execute(**request_map)
+        return parse_soap_response(response)
+
+
 def zeep_session_factory(wsdl: str, timeout: float):
-    """真实 SOAP 会话。测试不调用这里，避免打开 WSDL。Execute 只发一次。"""
+    """打开 WSDL 并挂上仓库 CA。测试不调用这里。Execute 只发一次。"""
     import requests
     import zeep
     from zeep.transports import Transport
 
     http = configure_http_session(requests.Session())
     client = zeep.Client(wsdl, transport=Transport(session=http, timeout=timeout))
-
-    class ZeepSession:
-        def create_session(self, username: str) -> str:
-            with client.settings(raw_response=True):
-                response = client.service.CreateSession(username=username)
-            parsed = parse_soap_response(response)
-            created = parsed.get("Body", {}).get("CreateSessionResponse", {})
-            session_id = created.get("sessionId") if isinstance(created, dict) else None
-            if as_code(created.get("resultCode") if isinstance(created, dict) else None) != "2" or not session_id:
-                raise RuntimeError("获取 session 失败")
-            return str(session_id)
-
-        def execute(self, request_map: dict):
-            with client.settings(raw_response=True):
-                return client.service.Execute(**request_map)
-
-    return ZeepSession()
+    return SoapSession(client)
 
 
 def _sms(center, content, phone: str, task_id) -> None:

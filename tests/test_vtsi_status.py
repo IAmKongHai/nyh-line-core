@@ -10,10 +10,12 @@ from nyh_line.lines import dito_vtsi, globe_vtsi, smart_vtsi
 VTSI_LINES = (dito_vtsi, globe_vtsi, smart_vtsi)
 from nyh_line.upstream.vtsi import (
     CA_FILES,
+    SoapSession,
     VtsiGateway,
     configure_http_session,
     parse_wallet_balance,
     repo_cert_dir,
+    result_code_of,
 )
 from tests.support import FakeTransport, actions, make_center
 
@@ -316,6 +318,93 @@ def test_balance_queries_wallet_with_account_and_parses_xml():
     assert parse_wallet_balance(gateway.balance()) == "12"
     assert sink[0]["command"] == "GETWALLETBALANCE"
     assert "<accountNo>ACC100</accountNo>" in sink[0]["data"]
+
+
+class _RawResponse:
+    def __init__(self, content: bytes):
+        self.content = content
+
+
+class _FakeZeepClient:
+    """不打开 WSDL。settings 和 service 的形状与 zeep 原始响应一致。"""
+
+    def __init__(self, execute_xml: str, create_xml: str):
+        self.execute_xml = execute_xml
+        self.create_xml = create_xml
+        self.calls = []
+        self.service = self
+
+    def settings(self, **_kwargs):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def CreateSession(self, username):
+        self.calls.append(("CreateSession", username))
+        return _RawResponse(self.create_xml.encode("ISO-8859-1"))
+
+    def Execute(self, **request_map):
+        self.calls.append(("Execute", request_map))
+        return _RawResponse(self.execute_xml.encode("ISO-8859-1"))
+
+
+def test_soap_session_parses_execute_before_result_code():
+    execute_xml = (
+        '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+        "<soap:Body><ExecuteResponse><resultCode>25</resultCode></ExecuteResponse></soap:Body>"
+        "</soap:Envelope>"
+    )
+    create_xml = (
+        "<Envelope><Body><CreateSessionResponse>"
+        "<resultCode>2</resultCode><sessionId>SID9</sessionId>"
+        "</CreateSessionResponse></Body></Envelope>"
+    )
+    fake = _FakeZeepClient(execute_xml, create_xml)
+    gateway = VtsiGateway(
+        lambda: SoapSession(fake),
+        username="nyh-user",
+        password="pw",
+        account="ACC100",
+        timeout=10,
+    )
+    result = gateway.topup(merchant_transaction_id="v9", phone="09123456789", sku="SKU1")
+    assert result_code_of(result) == "25"
+    execute_calls = [item for item in fake.calls if item[0] == "Execute"]
+    assert len(execute_calls) == 1
+    body = execute_calls[0][1]
+    assert body["command"] == "TOPUP"
+    assert body["sessionId"] == "SID9"
+    assert body["username"] == "nyh-user"
+    assert body["password"] == hashlib.sha1(b"nyh-userpwSID9").hexdigest()
+    assert "<merchantTransactionId>v9</merchantTransactionId>" in body["data"]
+    assert "<accountNo>" not in body["data"]
+
+
+def test_soap_session_balance_uses_account_and_repo_parser():
+    inner = "<wallets><wallet><accountNo>ACC100</accountNo><balance>12</balance></wallet></wallets>"
+    execute_xml = _soap_with_return_xml("2", inner)
+    create_xml = (
+        "<Envelope><Body><CreateSessionResponse>"
+        "<resultCode>2</resultCode><sessionId>SID9</sessionId>"
+        "</CreateSessionResponse></Body></Envelope>"
+    )
+    fake = _FakeZeepClient(execute_xml, create_xml)
+    gateway = VtsiGateway(
+        lambda: SoapSession(fake),
+        username="nyh-user",
+        password="pw",
+        account="ACC100",
+        timeout=10,
+    )
+    assert parse_wallet_balance(gateway.balance()) == "12"
+    body = [item[1] for item in fake.calls if item[0] == "Execute"][0]
+    assert body["command"] == "GETWALLETBALANCE"
+    assert "<accountNo>ACC100</accountNo>" in body["data"]
+    assert "verify" not in body
 
 
 def test_http_session_verify_includes_repo_cas():
