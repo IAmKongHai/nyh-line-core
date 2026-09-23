@@ -3,5 +3,5 @@
 from nyh_line.upstream.fd import submit_fd_task
 
 
-def submit_task(task, center, client) -> str:
-    return submit_fd_task(task, center, client, notify=True)
+def submit_task(task, center, client, on_unknown=None) -> str:
+    return submit_fd_task(task, center, client, notify=True, on_unknown=on_unknown)

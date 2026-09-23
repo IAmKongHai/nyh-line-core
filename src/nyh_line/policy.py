@@ -16,12 +16,19 @@ class LinePolicy:
     timeout: float | None = None
     busy_sleep: float = 0.2
     balance_interval: float = 60
+    # 菲岛：连续这么多笔结果未知就暂停拉单。0 表示不暂停。
+    unknown_pause_after: int = 0
+    unknown_pause_seconds: float = 0
 
 
 # 无任务时的等待按现有进程保留，不收成一个数。
 _POLICIES = {
-    ("fd-globe", "submit"): LinePolicy("fd-globe", "submit", 1, 7, 15, False),
-    ("fd-smart", "submit"): LinePolicy("fd-smart", "submit", 1, 7, 15, False),
+    ("fd-globe", "submit"): LinePolicy(
+        "fd-globe", "submit", 1, 7, 15, False, unknown_pause_after=3, unknown_pause_seconds=60
+    ),
+    ("fd-smart", "submit"): LinePolicy(
+        "fd-smart", "submit", 1, 7, 15, False, unknown_pause_after=3, unknown_pause_seconds=60
+    ),
     ("vtsi-dito", "submit"): LinePolicy("vtsi-dito", "submit", 1, 7, 15, True, timeout=50),
     ("vtsi-dito", "check"): LinePolicy("vtsi-dito", "check", 1, 7, 15, True, timeout=50, busy_sleep=0.2),
     ("vtsi-globe", "submit"): LinePolicy("vtsi-globe", "submit", 4, 30, 60, True, timeout=50),

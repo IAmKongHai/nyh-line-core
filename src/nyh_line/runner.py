@@ -89,6 +89,42 @@ def wait_or_stop(stop: threading.Event, seconds: float, sleeper=None) -> bool:
     return not interrupted
 
 
+class UnknownStreak:
+    """菲岛连续结果未知时暂停拉单。只看提交结果，handle 抛错不计入也不清零。"""
+
+    # 这些结果说明上游给了明确答复或确认没发出，计数清零。
+    _CLEARS = {"accepted", "business-fail", "maintenance", "not-sent"}
+
+    def __init__(self, threshold: int, pause_seconds: float, wait, log=None):
+        self.threshold = threshold
+        self.pause_seconds = pause_seconds
+        self.wait = wait
+        self.log = log or logger
+        self.count = 0
+        self.last_reason = ""
+
+    def note_reason(self, reason) -> None:
+        self.last_reason = str(reason)
+
+    def observe(self, outcome) -> None:
+        if outcome in self._CLEARS:
+            self.count = 0
+            return
+        if outcome != "unknown" or self.threshold <= 0:
+            return
+        self.count += 1
+        if self.count < self.threshold:
+            return
+        self.log.critical(
+            "连续 %s 笔结果未知，暂停拉单 %s 秒 last_error=%s",
+            self.count,
+            self.pause_seconds,
+            self.last_reason,
+        )
+        self.count = 0
+        self.wait(self.pause_seconds)
+
+
 class XiaolaSubmitLoop:
     """赢啦提交循环。批次没走完之前不再拉下一单。"""
 

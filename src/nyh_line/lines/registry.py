@@ -14,7 +14,15 @@ from nyh_line.center.profiles import device_new_profile, xiaola_profile
 from nyh_line.http_transport import requests_transport
 from nyh_line.lines import dito_vtsi, globe_fd, globe_vtsi, smart_fd, smart_vtsi, yingla
 from nyh_line.policy import known_role, policy_for
-from nyh_line.runner import PollLoop, XiaolaSubmitLoop, apply_batch_config, install_signals, maintain
+from nyh_line.runner import (
+    PollLoop,
+    UnknownStreak,
+    XiaolaSubmitLoop,
+    apply_batch_config,
+    install_signals,
+    maintain,
+    wait_or_stop,
+)
 from nyh_line.settings import (
     alert_user_ids,
     center_base_url,
@@ -88,8 +96,22 @@ def _records(payload) -> list:
     return []
 
 
-def _serve_fd(line: str, env, stop: threading.Event) -> None:
+def build_fd_loop(line: str, center, client, stop: threading.Event, *, wait=None, sleep=None, randint=None) -> PollLoop:
+    """菲岛提交循环。连续结果未知达到策略阈值时，在这一笔之后暂停拉单。"""
     policy = policy_for(line, "submit")
+    pause = wait or (lambda seconds: wait_or_stop(stop, seconds))
+    streak = UnknownStreak(policy.unknown_pause_after, policy.unknown_pause_seconds, pause)
+    submit = _FD_SUBMIT[line]
+
+    def handle(task):
+        outcome = submit(task, center, client, on_unknown=streak.note_reason)
+        streak.observe(outcome)
+        return outcome
+
+    return PollLoop(policy, center.get_task, handle, sleep=sleep, randint=randint, stop=stop)
+
+
+def _serve_fd(line: str, env, stop: threading.Event) -> None:
     center = _make_center(env, line, device_new_profile())
     prefix = "FD_GLOBE" if line == "fd-globe" else "FD_SMART"
     client = FdClient(
@@ -98,8 +120,7 @@ def _serve_fd(line: str, env, stop: threading.Event) -> None:
         key=env[f"{prefix}_KEY"],
         transport=requests_transport(),
     )
-    submit = _FD_SUBMIT[line]
-    loop = PollLoop(policy, center.get_task, lambda task: submit(task, center, client), stop=stop)
+    loop = build_fd_loop(line, center, client, stop)
     install_signals(loop)
     while not stop.is_set():
         loop.run_round()
