@@ -107,7 +107,7 @@ PYTHONPATH=src python -m nyh_line fd-globe submit
 以下情况不回写，发送行保持执行中，日志有一条带 `task_id` 的 ERROR：
 
 - 菲岛：请求可能已到达上游（连接被对端断开或重置、读超时、SSL 错误，或响应无法解析）。只有连接阶段失败（连接超时、DNS 解析失败、连接被拒）才回写 0。同一条菲岛线路连续 3 笔结果未知时，暂停拉单 60 秒，只记一条 CRITICAL。
-- VTSI：TOPUP 发出后超时（Smart 10 秒，Dito、Globe 50 秒），或拉单后 15 秒内没能发出 TOPUP。由查单按 `v<task_id>` 对账收口。
+- VTSI：TOPUP 发出后超时（Smart 10 秒，Dito、Globe 50 秒），或拉单后 15 秒内没能发出 TOPUP。由查单按 `v<task_id>` 对账收口。查单 statusCode 2 回写 2，3 回写 3，4（取消，VTSI 不扣款）和 25 回写 0；1（处理中）继续查，不写短信记录。
 - 赢啦：下单超时或响应无法解析。由查单按 `nyh<task_id>` 对账收口。
 
 菲岛没有查单。停在执行中且始终没有回调的菲岛单，按 `task_id` 查日志确认后，由人工在 Center 回滚。

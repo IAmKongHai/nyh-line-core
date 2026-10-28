@@ -379,11 +379,12 @@ def submit_vtsi_task(task: dict, center, gateway: VtsiGateway, *, terminal_fail:
     return f"feedback-{status}"
 
 
-_CHECK_TERMINAL = {"2": 2, "3": 3, "25": 0}
+# statusCode：1 处理中、2 已完成、3 失败、4 取消。取消的单 VTSI 不扣款，按回滚回写 0。
+_CHECK_TERMINAL = {"2": 2, "3": 3, "4": 0, "25": 0}
 
 
 def check_vtsi_task(record: dict, center, gateway: VtsiGateway) -> str:
-    """查单从上到下只命中一行。短信只在表里写明的时候写。"""
+    """查单从上到下只命中一行。短信只在查到终态、要回写时写，处理中不写。"""
     task_id = record["id"]
     merchant_id = "v" + str(task_id)
     try:
@@ -398,11 +399,11 @@ def check_vtsi_task(record: dict, center, gateway: VtsiGateway) -> str:
         return "rollback"
     if code != "2":
         return "ignore"
-    # 查单的短信接收用 Center 下发的原号，与旧三条查单一致。
-    _sms(center, result, str(record.get("user_number", "")), task_id)
     status_code = status_code_of(result)
     mapped = _CHECK_TERMINAL.get(status_code)
     if mapped is None:
         return "pending"
+    # 查单的短信接收用 Center 下发的原号，与旧三条查单一致。
+    _sms(center, result, str(record.get("user_number", "")), task_id)
     center.feedback(task_id, mapped, result)
     return f"feedback-{mapped}"
